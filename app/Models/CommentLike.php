@@ -28,7 +28,9 @@ class CommentLike extends Model
      */
     const UPDATED_AT = null;
 
-    // ── Relationships ──────────────────────────────────────────────
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //  Relationships
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     /**
      * The user who liked the comment.

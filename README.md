@@ -291,7 +291,29 @@ Schema::create('comment_likes', function (Blueprint $table) {
 
 **Requirement**: Eloquent model with self-referential relationships, query scopes that leverage composite indexes, depth enforcement, and atomic counter methods.
 
-**Key features**:
+**Relationships**:
+
+| Method | Return | Purpose |
+|---|---|---|
+| `parent()` | `BelongsTo` | Direct parent comment (NULL for roots) |
+| `replies()` | `HasMany` | Direct child replies, ordered by `created_at` |
+| `root()` | `BelongsTo` | Thread ancestor (the root-level comment) |
+| `thread()` | `HasMany` | All descendants in the thread (flat query) |
+| `likes()` | `HasMany` | Like records on this comment |
+| `user()` | `BelongsTo` | Comment author |
+| `post()` | `BelongsTo` | Parent post |
+
+**Scopes**:
+
+| Scope | Index Used | Purpose |
+|---|---|---|
+| `topLevel()` | `idx_post_roots` | Only depth=0 comments |
+| `forPost($id)` | `idx_post_roots` | Filter by post |
+| `inThread($rootId)` | `idx_thread_replies` | All replies in a thread |
+| `withEagerLoads($authUserId)` | — | Preset: users + replies + auth likes |
+| `withThreadLoads($authUserId)` | — | Preset: users + auth likes (flat thread) |
+
+**Key methods**:
 
 ```php
 // Depth guard — prevents nesting beyond level 2
@@ -307,8 +329,8 @@ public function resolveRootId(): int
 }
 
 // Scopes — each maps to a composite index
-Comment::roots()->forPost($postId)->latest()->paginate();  // idx_post_roots
-Comment::inThread($rootId)->get();                          // idx_thread_replies
+Comment::forPost($postId)->topLevel()->latest()->paginate();  // idx_post_roots
+Comment::inThread($rootId)->get();                             // idx_thread_replies
 ```
 
 ---
@@ -326,23 +348,78 @@ class CommentLike extends Model
 
 ---
 
+### Step 6: Optimized Eager Loading (Avoid N+1)
+
+**Requirement**: Zero N+1 queries. Every relationship accessed in a loop must be pre-loaded.
+
+**❌ The N+1 trap** — never do this:
+
+```php
+$comments = Comment::forPost($postId)->topLevel()->paginate(25);
+
+foreach ($comments as $comment) {
+    $comment->user;           // ❌ N+1 — fires 25 queries
+    $comment->replies;        // ❌ N+1 — fires 25 more queries
+    $comment->likes()->count(); // ❌ N+1 — fires 25 COUNT queries
+}
+```
+
+**✅ The correct way** — use `withEagerLoads()` preset:
+
+```php
+// 7 queries total regardless of page size (not 75+)
+$comments = Comment::forPost($postId)
+    ->topLevel()
+    ->withEagerLoads(auth()->id())
+    ->latest()
+    ->paginate(25);
+
+// Queries fired:
+// 1. SELECT * FROM comments WHERE post_id=? AND depth=0 ORDER BY created_at DESC LIMIT 25
+// 2. SELECT id,name FROM users WHERE id IN (...)           -- root authors
+// 3. SELECT * FROM comments WHERE parent_id IN (...)       -- depth-1 replies
+// 4. SELECT id,name FROM users WHERE id IN (...)           -- depth-1 authors
+// 5. SELECT * FROM comments WHERE parent_id IN (...)       -- depth-2 replies
+// 6. SELECT id,name FROM users WHERE id IN (...)           -- depth-2 authors
+// 7. SELECT id,comment_id,user_id FROM comment_likes WHERE user_id=? AND comment_id IN (...)
+```
+
+**✅ Thread expansion** — lighter preset:
+
+```php
+$thread = Comment::inThread($rootId)
+    ->withThreadLoads(auth()->id())
+    ->get();
+
+// 3 queries total:
+// 1. SELECT * FROM comments WHERE root_id=? ORDER BY depth, created_at
+// 2. SELECT id,name FROM users WHERE id IN (...)
+// 3. SELECT id,comment_id,user_id FROM comment_likes WHERE user_id=? AND comment_id IN (...)
+```
+
+---
+
 ## 🚀 Usage Examples
 
 ### Load paginated root comments for a post
 
 ```php
 $comments = Comment::forPost($postId)
-    ->roots()
+    ->topLevel()
+    ->withEagerLoads(auth()->id())
     ->latest()
     ->paginate(25);
 // Uses idx_post_roots → O(log n + 25) → ~3ms
+// 7 queries total — zero N+1
 ```
 
 ### Load all replies in a thread (no recursion)
 
 ```php
-$replies = Comment::inThread($rootCommentId)->get();
-// Uses idx_thread_replies → single flat query → ~2ms
+$replies = Comment::inThread($rootCommentId)
+    ->withThreadLoads(auth()->id())
+    ->get();
+// Uses idx_thread_replies → 3 queries total → ~2ms
 ```
 
 ### Create a reply with depth guard
