@@ -190,7 +190,9 @@ app/
 │   ├── Comment.php          # Core model: relationships, scopes, depth guard, counters
 │   ├── CommentLike.php      # Write-once like record (no updated_at)
 │   ├── Post.php             # FK target with rootComments() relationship
-│   └── User.php             # Laravel default
+│   ├── User.php             # Laravel default
+├── Services/
+│   └── CommentService.php   # Business logic: transactions, depth guards, counters
 database/
 ├── migrations/
 │   ├── 0001_01_01_000000_create_users_table.php
@@ -399,66 +401,75 @@ $thread = Comment::inThread($rootId)
 
 ---
 
+### Step 7: Comment Service
+
+**Requirement**: Business logic layer to handle complex operations (depth calculation, root_id propagation, counter sync) within database transactions.
+
+**Key Methods**:
+
+| Method | Purpose |
+|---|---|
+| `createComment()` | Create a root-level comment |
+| `replyToComment()` | Create a reply with depth/root_id logic & counter sync |
+| `deleteComment()` | Soft-delete and update parent reply_count |
+| `toggleLike()` | Idempotent like/unlike with counter sync |
+| `getCommentsForPost()` | Optimized paginated read |
+| `getThread()` | Load full thread in a single flat query |
+
+---
+
 ## 🚀 Usage Examples
 
 ### Load paginated root comments for a post
 
 ```php
-$comments = Comment::forPost($postId)
-    ->topLevel()
-    ->withEagerLoads(auth()->id())
-    ->latest()
-    ->paginate(25);
-// Uses idx_post_roots → O(log n + 25) → ~3ms
-// 7 queries total — zero N+1
+$service = new \App\Services\CommentService();
+
+$comments = $service->getCommentsForPost(
+    postId: $postId,
+    authUserId: auth()->id(),
+    perPage: 25
+);
+// Returns 25 root comments with nested replies (7 queries total)
 ```
 
-### Load all replies in a thread (no recursion)
+### Create a reply (safe)
 
 ```php
-$replies = Comment::inThread($rootCommentId)
-    ->withThreadLoads(auth()->id())
-    ->get();
-// Uses idx_thread_replies → 3 queries total → ~2ms
-```
+$service = new \App\Services\CommentService();
 
-### Create a reply with depth guard
-
-```php
-if ($parent->isMaxDepth()) {
-    throw new \DomainException('Maximum nesting depth reached.');
+try {
+    $reply = $service->replyToComment(
+        parentId: $commentId,
+        userId: auth()->id(),
+        content: "This is a reply"
+    );
+} catch (\DomainException $e) {
+    // Handle "Maximum nesting depth reached"
 }
-
-$reply = Comment::create([
-    'post_id'   => $parent->post_id,
-    'user_id'   => auth()->id(),
-    'parent_id' => $parent->id,
-    'root_id'   => $parent->resolveRootId(),
-    'depth'     => $parent->depth + 1,
-    'content'   => $validated['content'],
-]);
-
-$parent->incrementReplyCount();
 ```
 
-### Toggle like (idempotent)
+### Toggle a like
 
 ```php
-DB::transaction(function () use ($comment, $user) {
-    $existing = CommentLike::where('user_id', $user->id)
-                           ->where('comment_id', $comment->id)
-                           ->first();
-    if ($existing) {
-        $existing->delete();
-        $comment->decrementLikeCount();
-    } else {
-        CommentLike::create([
-            'user_id'    => $user->id,
-            'comment_id' => $comment->id,
-        ]);
-        $comment->incrementLikeCount();
-    }
-});
+$service = new \App\Services\CommentService();
+
+$isLiked = $service->toggleLike(
+    commentId: $commentId,
+    userId: auth()->id()
+);
+// Returns true (liked) or false (unliked)
+```
+
+### Delete a comment
+
+```php
+$service = new \App\Services\CommentService();
+
+$service->deleteComment(
+    commentId: $commentId,
+    userId: auth()->id()
+);
 ```
 
 ---
