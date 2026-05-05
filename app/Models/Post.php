@@ -12,11 +12,23 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 /**
  * Minimal Post model — serves as the parent entity for comments.
  */
-#[Fillable(['user_id', 'title', 'body'])]
+#[Fillable(['user_id', 'title', 'body', 'is_visible'])]
 class Post extends Model
 {
     /** @use HasFactory<PostFactory> */
     use HasFactory;
+
+    protected function casts(): array
+    {
+        return [
+            'is_visible' => 'boolean',
+        ];
+    }
+
+    public function scopeVisible($query)
+    {
+        return $query->where('is_visible', true);
+    }
 
     /**
      * The user who authored this post.

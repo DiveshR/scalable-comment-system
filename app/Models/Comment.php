@@ -46,11 +46,18 @@ use Illuminate\Database\Eloquent\SoftDeletes;
  * │    ✅ Use ->with() or ->withCount() BEFORE the query             │
  * └──────────────────────────────────────────────────────────────────┘
  */
-#[Fillable(['post_id', 'user_id', 'parent_id', 'root_id', 'depth', 'content'])]
+#[Fillable(['post_id', 'user_id', 'parent_id', 'root_id', 'depth', 'content', 'is_visible'])]
 class Comment extends Model
 {
     /** @use HasFactory<CommentFactory> */
     use HasFactory, SoftDeletes;
+
+    protected function casts(): array
+    {
+        return [
+            'is_visible' => 'boolean',
+        ];
+    }
 
     /**
      * Maximum allowed nesting depth.
@@ -146,6 +153,11 @@ class Comment extends Model
     //  Scopes
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+    public function scopeVisible(Builder $query): Builder
+    {
+        return $query->where('is_visible', true);
+    }
+
     /**
      * Only top-level (root) comments where depth = 0.
      *
@@ -220,9 +232,11 @@ class Comment extends Model
         $query->with([
             'user:id,name',
             'replies' => function (HasMany $q) {
-                $q->with([
+                $q->visible()->with([
                     'user:id,name',
-                    'replies.user:id,name',
+                    'replies' => function (HasMany $sq) {
+                        $sq->visible()->with('user:id,name');
+                    },
                 ]);
             },
         ]);

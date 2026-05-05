@@ -234,6 +234,7 @@ class CommentService
         int $perPage = 15,
     ): LengthAwarePaginator {
         return Comment::forPost($postId)
+            ->visible()
             ->topLevel()
             ->withEagerLoads($authUserId)
             ->latest()
@@ -259,6 +260,7 @@ class CommentService
     public function getThread(int $rootCommentId, ?int $authUserId = null): Collection
     {
         return Comment::inThread($rootCommentId)
+            ->visible()
             ->withThreadLoads($authUserId)
             ->get();
     }

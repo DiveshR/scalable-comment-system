@@ -1,499 +1,95 @@
-# Scalable Comment System
+# Scalable Comment System — Production Architecture
 
-A production-grade, high-performance nested comment system built with **Laravel 13** and **MySQL**, designed for Filament-based admin panels.
-
----
-
-## 📋 The Problem
-
-Most comment systems use one of two approaches:
-
-1. **Simple adjacency list** (`parent_id` only) — requires recursive CTEs or multiple queries to load a thread. Breaks at scale.
-2. **Nested set / Materialized path** — complex write operations, fragile rebalancing, hard to maintain.
-
-Both fail when you need:
-- **Millions of comments** with sub-100ms reads
-- **Nested replies** without recursive database queries
-- **Real-time counters** (likes, reply counts) without expensive `COUNT(*)` subqueries
+A high-performance, production-grade nested comment system built with **Laravel 13**, **MySQL**, and **Filament v4**. Designed for sub-100ms read performance at scale (10M+ rows) using a flat-tree architecture.
 
 ---
 
-## 🎯 Requirements
+## 🚀 System Architecture
 
-| Requirement | Constraint |
-|---|---|
-| Nested comments | Max depth = 3 levels (root → reply → reply-to-reply) |
-| Read performance | < 100ms at millions of rows |
-| Scalability | Designed for 10M+ comments |
-| No recursive queries | Zero CTEs, zero self-joins |
-| Soft deletes | Preserve thread structure when comments are removed |
-| Like system | One like per user per comment, enforced at DB level |
-| Denormalized counters | `like_count` and `reply_count` on each comment row |
+This system eliminates the "Recursive Query" problem found in standard comment systems by utilizing a **Flat-Tree** approach.
 
----
-
-## 🏗️ Architecture: The Flat-Tree Approach
-
-We use a **hybrid adjacency list + flat-tree** design:
-
-- `parent_id` → direct parent (standard adjacency list)
-- `root_id` → thread ancestor (flat-tree innovation)
-- `depth` → nesting level (0, 1, or 2)
-
-This gives us the **write simplicity** of adjacency lists with the **read performance** of flat tables.
-
-### Why `root_id` Is the Key Innovation
-
-**Without `root_id`**, loading a thread requires recursion:
-
-```sql
--- ❌ Recursive CTE — O(n) with temp tables, kills MySQL at scale
-WITH RECURSIVE thread AS (
-    SELECT * FROM comments WHERE id = :root_id
-    UNION ALL
-    SELECT c.* FROM comments c
-    JOIN thread t ON c.parent_id = t.id
-)
-SELECT * FROM thread;
-```
-
-**With `root_id`**, every comment in a thread shares the same `root_id`:
-
-```sql
--- ✅ Single flat query — O(log n) index seek + O(k) scan
-SELECT * FROM comments
-WHERE root_id = :root_id
-ORDER BY depth ASC, created_at ASC;
-```
-
-**How `root_id` is populated on reply creation:**
-
-```php
-$reply->root_id = $parent->root_id ?? $parent->id;
-$reply->depth   = $parent->depth + 1;
-```
-
-Root comments have `root_id = NULL`. All descendants share the root's `id` as their `root_id`.
-
-### Why Denormalization (`like_count`, `reply_count`)
-
-**Without denormalization**, every page load requires N+1 subqueries:
-
-```sql
--- ❌ For 25 comments, this runs 25 COUNT subqueries
-SELECT c.*,
-    (SELECT COUNT(*) FROM comment_likes WHERE comment_id = c.id) AS likes,
-    (SELECT COUNT(*) FROM comments WHERE parent_id = c.id) AS replies
-FROM comments c
-WHERE post_id = :post_id AND depth = 0
-LIMIT 25;
-```
-
-**With denormalization**, counters are pre-computed columns:
-
-```sql
--- ✅ Zero subqueries — counters are on the row itself
-SELECT * FROM comments
-WHERE post_id = :post_id AND depth = 0
-ORDER BY created_at DESC
-LIMIT 25;
-```
-
-**Trade-off**: Every like/reply requires an atomic `INCREMENT` — but reads outnumber writes 100:1 in comment systems, making this an excellent trade-off.
-
----
-
-## 📊 Database Schema
-
-### `comments` Table
-
-| Column | Type | Purpose |
+| Feature | Implementation | Performance |
 |---|---|---|
-| `id` | `BIGINT UNSIGNED` PK | Auto-increment primary key |
-| `post_id` | `BIGINT UNSIGNED` FK | Which post this comment belongs to |
-| `user_id` | `BIGINT UNSIGNED` FK | Who authored the comment |
-| `parent_id` | `BIGINT UNSIGNED` nullable FK | Direct parent comment (NULL = root) |
-| `root_id` | `BIGINT UNSIGNED` nullable FK | Thread ancestor (NULL = is root) |
-| `depth` | `TINYINT UNSIGNED` | Nesting level: 0=root, 1=reply, 2=reply-to-reply |
-| `content` | `TEXT` | Comment body |
-| `like_count` | `INT UNSIGNED` | Denormalized like counter |
-| `reply_count` | `INT UNSIGNED` | Denormalized reply counter |
-| `created_at` | `TIMESTAMP` | Creation timestamp |
-| `updated_at` | `TIMESTAMP` | Last update timestamp |
-| `deleted_at` | `TIMESTAMP` nullable | Soft delete timestamp |
-
-### `comment_likes` Table
-
-| Column | Type | Purpose |
-|---|---|---|
-| `id` | `BIGINT UNSIGNED` PK | Auto-increment primary key |
-| `user_id` | `BIGINT UNSIGNED` FK | Who liked |
-| `comment_id` | `BIGINT UNSIGNED` FK | What was liked |
-| `created_at` | `TIMESTAMP` | When the like happened |
-
-**Constraint**: `UNIQUE(user_id, comment_id)` — prevents double-likes at the database level.
+| **Reads** | Single flat query using `root_id` | **O(log n)** index seek |
+| **Nesting** | Max depth = 3 levels | Enforced by Service Layer |
+| **N+1 Queries** | Eager-loading presets (7 queries total) | **O(1)** regardless of page size |
+| **Counters** | Denormalized `like_count` & `reply_count` | Zero subqueries on read |
+| **Authorization** | Centralized `PostPolicy` | Owner/Admin permissions |
 
 ---
 
-## 🔑 Index Strategy (Critical for Performance)
+## 📂 Project Flow & Panels
 
-Every composite index is designed for a specific query pattern. Column order follows the B-tree optimization rule: **equality filters first → range/sort columns last**.
+The application is divided into three distinct zones:
 
-### `comments` Table — 4 Composite Indexes
+### 1. Public Feed (`/`)
+*   Displays a global feed of all posts from **regular users**.
+*   Real-time relative timestamps and author badges.
+*   Guest users can browse posts but must register/login to interact.
 
-| Index Name | Columns | Query Pattern | Why This Column Order? |
-|---|---|---|---|
-| `idx_post_roots` | `(post_id, depth, created_at)` | Paginated root comments for a post | `post_id` = equality, `depth=0` = equality, `created_at` = sort |
-| `idx_thread_replies` | `(root_id, depth, created_at)` | All replies in a thread | `root_id` = equality, `depth` = group, `created_at` = sort |
-| `idx_parent_children` | `(parent_id, created_at)` | Direct children of a comment | `parent_id` = equality, `created_at` = sort |
-| `idx_user_comments` | `(user_id, created_at)` | "My comments" listing | `user_id` = equality, `created_at` = sort |
+### 2. User Panel (`/app`)
+*   **Registration & Login**: Full auth flow included.
+*   **My Posts**: Users can create, edit, and delete their own posts.
+*   **Discussion**: Full interaction suite (Comment, Reply, Like, Delete).
+*   **Dashboard**: Shows personal stats (total posts and comments) and latest activity.
 
-### `comment_likes` Table — 1 Unique + 1 Index
-
-| Index Name | Columns | Query Pattern |
-|---|---|---|
-| `uq_user_comment_like` | `(user_id, comment_id)` UNIQUE | "Has this user liked?" + prevents duplicates |
-| `idx_comment_likers` | `(comment_id, created_at)` | "Who liked this comment?" list |
-
-### Why NOT Single-Column Indexes?
-
-Single-column indexes on `post_id`, `user_id`, etc. would force MySQL to:
-
-1. Scan the index to find matching rows
-2. Perform a **filesort** on `created_at` (temp table + sort buffer)
-
-Composite indexes eliminate the filesort — MySQL reads rows in correct order directly from the B-tree. At millions of rows, this is **5ms vs 500ms**.
+### 3. Admin Panel (`/admin`)
+*   **Global Management**: Admins can view all posts and manage comment visibility.
+*   **User Moderation**: Admins can activate or deactivate user accounts (read-only mode for user details).
+*   **Dashboard**: Shows global stats and top performing posts/users.
 
 ---
 
-## ⏱️ Time Complexity Analysis
+## 🔑 Login Credentials
 
-| Operation | Query | Index Used | Complexity | ~Latency (10M rows) |
-|---|---|---|---|---|
-| List root comments | `WHERE post_id=? AND depth=0 ORDER BY created_at DESC LIMIT 25` | `idx_post_roots` | O(log n + k) | 2-5ms |
-| Load thread replies | `WHERE root_id=? ORDER BY depth, created_at` | `idx_thread_replies` | O(log n + k) | 1-3ms |
-| Get direct children | `WHERE parent_id=? ORDER BY created_at` | `idx_parent_children` | O(log n + k) | 1-2ms |
-| User's comments | `WHERE user_id=? ORDER BY created_at DESC LIMIT 25` | `idx_user_comments` | O(log n + k) | 2-4ms |
-| Toggle like | `INSERT ON DUPLICATE` + `INCREMENT` | `uq_user_comment_like` | O(log n) | 3-8ms |
-| Check "has liked" | `WHERE user_id=? AND comment_id=?` | `uq_user_comment_like` | O(log n) | <1ms |
-| Create comment | `INSERT` + `INCREMENT reply_count` | PK | O(log n) | 3-6ms |
+Run `php artisan migrate:fresh --seed` to initialize the database with these accounts:
 
-> **n** = total rows, **k** = result set size (typically 5-50). All operations are effectively constant time.
+### Admin User
+- **URL**: [http://localhost:8000/admin](http://localhost:8000/admin)
+- **Email**: `admin@admin.com`
+- **Password**: `password`
 
----
-
-## 📂 Project Structure
-
-```
-app/
-├── Models/
-│   ├── Comment.php          # Core model: relationships, scopes, depth guard, counters
-│   ├── CommentLike.php      # Write-once like record (no updated_at)
-│   ├── Post.php             # FK target with rootComments() relationship
-│   ├── User.php             # Laravel default
-├── Services/
-│   └── CommentService.php   # Business logic: transactions, depth guards, counters
-database/
-├── migrations/
-│   ├── 0001_01_01_000000_create_users_table.php
-│   ├── 0001_01_01_000001_create_cache_table.php
-│   ├── 0001_01_01_000002_create_jobs_table.php
-│   ├── 2026_05_05_000000_create_posts_table.php
-│   ├── 2026_05_05_000001_create_comments_table.php    # 4 composite indexes
-│   └── 2026_05_05_000002_create_comment_likes_table.php # unique + reverse index
-```
+### Regular User
+- **URL**: [http://localhost:8000/app](http://localhost:8000/app)
+- **Email**: `user@user.com`
+- **Password**: `password`
 
 ---
 
-## 🛠️ Implementation Details
+## 🛠️ Tech Stack & Implementation
 
-### Step 1: Posts Table (FK Target)
+### Database Schema
+We use 4 composite indexes on the `comments` table to map exactly to query patterns:
+1.  `idx_post_roots`: `(post_id, depth, created_at)`
+2.  `idx_thread_replies`: `(root_id, depth, created_at)`
+3.  `idx_parent_children`: `(parent_id, created_at)`
+4.  `idx_user_comments`: `(user_id, created_at)`
 
-**Requirement**: Comments must belong to a post. We need a `posts` table as the foreign key target.
-
-**Migration**: `2026_05_05_000000_create_posts_table.php`
-
-```php
-Schema::create('posts', function (Blueprint $table) {
-    $table->id();
-    $table->foreignId('user_id')->constrained()->cascadeOnDelete();
-    $table->string('title');
-    $table->text('body');
-    $table->timestamps();
-});
-```
+### Service Layer (`CommentService.php`)
+All business logic is isolated here to keep the UI clean:
+*   `createComment()`: Atomic insertion.
+*   `replyToComment()`: Calculates `depth`, propagates `root_id`, and increments parent's `reply_count`.
+*   `toggleLike()`: Idempotent logic using DB-level unique constraints.
+*   `deleteComment()`: Soft-deletes and syncs counters.
 
 ---
 
-### Step 2: Comments Table (Core Schema)
-
-**Requirement**: Store nested comments with max depth 3, support millions of rows, and avoid recursive queries. Include denormalized counters for read performance.
-
-**Migration**: `2026_05_05_000001_create_comments_table.php`
-
-```php
-Schema::create('comments', function (Blueprint $table) {
-    $table->id();
-
-    // ── Relationships ──────────────────────────────────
-    $table->foreignId('post_id')->constrained()->cascadeOnDelete();
-    $table->foreignId('user_id')->constrained()->cascadeOnDelete();
-    $table->unsignedBigInteger('parent_id')->nullable();
-    $table->unsignedBigInteger('root_id')->nullable();
-
-    // ── Hierarchy ──────────────────────────────────────
-    $table->tinyInteger('depth')->unsigned()->default(0);
-
-    // ── Content ────────────────────────────────────────
-    $table->text('content');
-
-    // ── Denormalized Counters ──────────────────────────
-    $table->unsignedInteger('like_count')->default(0);
-    $table->unsignedInteger('reply_count')->default(0);
-
-    // ── Timestamps & Soft Delete ───────────────────────
-    $table->timestamps();
-    $table->softDeletes();
-
-    // ── Self-Referential Foreign Keys ──────────────────
-    $table->foreign('parent_id')->references('id')->on('comments')->nullOnDelete();
-    $table->foreign('root_id')->references('id')->on('comments')->cascadeOnDelete();
-
-    // ── Composite Indexes ──────────────────────────────
-    $table->index(['post_id', 'depth', 'created_at'], 'idx_post_roots');
-    $table->index(['root_id', 'depth', 'created_at'], 'idx_thread_replies');
-    $table->index(['parent_id', 'created_at'], 'idx_parent_children');
-    $table->index(['user_id', 'created_at'], 'idx_user_comments');
-});
-```
-
----
-
-### Step 3: Comment Likes Table
-
-**Requirement**: One like per user per comment, enforced at the database level (not application level). No `updated_at` needed — likes are write-once.
-
-**Migration**: `2026_05_05_000002_create_comment_likes_table.php`
-
-```php
-Schema::create('comment_likes', function (Blueprint $table) {
-    $table->id();
-    $table->foreignId('user_id')->constrained()->cascadeOnDelete();
-    $table->foreignId('comment_id')->constrained()->cascadeOnDelete();
-    $table->timestamp('created_at')->useCurrent();
-
-    $table->unique(['user_id', 'comment_id'], 'uq_user_comment_like');
-    $table->index(['comment_id', 'created_at'], 'idx_comment_likers');
-});
-```
-
----
-
-### Step 4: Comment Model
-
-**Requirement**: Eloquent model with self-referential relationships, query scopes that leverage composite indexes, depth enforcement, and atomic counter methods.
-
-**Relationships**:
-
-| Method | Return | Purpose |
-|---|---|---|
-| `parent()` | `BelongsTo` | Direct parent comment (NULL for roots) |
-| `replies()` | `HasMany` | Direct child replies, ordered by `created_at` |
-| `root()` | `BelongsTo` | Thread ancestor (the root-level comment) |
-| `thread()` | `HasMany` | All descendants in the thread (flat query) |
-| `likes()` | `HasMany` | Like records on this comment |
-| `user()` | `BelongsTo` | Comment author |
-| `post()` | `BelongsTo` | Parent post |
-
-**Scopes**:
-
-| Scope | Index Used | Purpose |
-|---|---|---|
-| `topLevel()` | `idx_post_roots` | Only depth=0 comments |
-| `forPost($id)` | `idx_post_roots` | Filter by post |
-| `inThread($rootId)` | `idx_thread_replies` | All replies in a thread |
-| `withEagerLoads($authUserId)` | — | Preset: users + replies + auth likes |
-| `withThreadLoads($authUserId)` | — | Preset: users + auth likes (flat thread) |
-
-**Key methods**:
-
-```php
-// Depth guard — prevents nesting beyond level 2
-public function isMaxDepth(): bool
-{
-    return $this->depth >= self::MAX_DEPTH; // MAX_DEPTH = 2
-}
-
-// Root ID resolver — auto-populates root_id on reply creation
-public function resolveRootId(): int
-{
-    return $this->root_id ?? $this->id;
-}
-
-// Scopes — each maps to a composite index
-Comment::forPost($postId)->topLevel()->latest()->paginate();  // idx_post_roots
-Comment::inThread($rootId)->get();                             // idx_thread_replies
-```
-
----
-
-### Step 5: CommentLike Model
-
-**Requirement**: Write-once model with no `updated_at`. Relationships to user and comment.
-
-```php
-class CommentLike extends Model
-{
-    const UPDATED_AT = null; // Likes are immutable once created
-}
-```
-
----
-
-### Step 6: Optimized Eager Loading (Avoid N+1)
-
-**Requirement**: Zero N+1 queries. Every relationship accessed in a loop must be pre-loaded.
-
-**❌ The N+1 trap** — never do this:
-
-```php
-$comments = Comment::forPost($postId)->topLevel()->paginate(25);
-
-foreach ($comments as $comment) {
-    $comment->user;           // ❌ N+1 — fires 25 queries
-    $comment->replies;        // ❌ N+1 — fires 25 more queries
-    $comment->likes()->count(); // ❌ N+1 — fires 25 COUNT queries
-}
-```
-
-**✅ The correct way** — use `withEagerLoads()` preset:
-
-```php
-// 7 queries total regardless of page size (not 75+)
-$comments = Comment::forPost($postId)
-    ->topLevel()
-    ->withEagerLoads(auth()->id())
-    ->latest()
-    ->paginate(25);
-
-// Queries fired:
-// 1. SELECT * FROM comments WHERE post_id=? AND depth=0 ORDER BY created_at DESC LIMIT 25
-// 2. SELECT id,name FROM users WHERE id IN (...)           -- root authors
-// 3. SELECT * FROM comments WHERE parent_id IN (...)       -- depth-1 replies
-// 4. SELECT id,name FROM users WHERE id IN (...)           -- depth-1 authors
-// 5. SELECT * FROM comments WHERE parent_id IN (...)       -- depth-2 replies
-// 6. SELECT id,name FROM users WHERE id IN (...)           -- depth-2 authors
-// 7. SELECT id,comment_id,user_id FROM comment_likes WHERE user_id=? AND comment_id IN (...)
-```
-
-**✅ Thread expansion** — lighter preset:
-
-```php
-$thread = Comment::inThread($rootId)
-    ->withThreadLoads(auth()->id())
-    ->get();
-
-// 3 queries total:
-// 1. SELECT * FROM comments WHERE root_id=? ORDER BY depth, created_at
-// 2. SELECT id,name FROM users WHERE id IN (...)
-// 3. SELECT id,comment_id,user_id FROM comment_likes WHERE user_id=? AND comment_id IN (...)
-```
-
----
-
-### Step 7: Comment Service
-
-**Requirement**: Business logic layer to handle complex operations (depth calculation, root_id propagation, counter sync) within database transactions.
-
-**Key Methods**:
-
-| Method | Purpose |
-|---|---|
-| `createComment()` | Create a root-level comment |
-| `replyToComment()` | Create a reply with depth/root_id logic & counter sync |
-| `deleteComment()` | Soft-delete and update parent reply_count |
-| `toggleLike()` | Idempotent like/unlike with counter sync |
-| `getCommentsForPost()` | Optimized paginated read |
-| `getThread()` | Load full thread in a single flat query |
-
----
-
-## 🚀 Usage Examples
-
-### Load paginated root comments for a post
-
-```php
-$service = new \App\Services\CommentService();
-
-$comments = $service->getCommentsForPost(
-    postId: $postId,
-    authUserId: auth()->id(),
-    perPage: 25
-);
-// Returns 25 root comments with nested replies (7 queries total)
-```
-
-### Create a reply (safe)
-
-```php
-$service = new \App\Services\CommentService();
-
-try {
-    $reply = $service->replyToComment(
-        parentId: $commentId,
-        userId: auth()->id(),
-        content: "This is a reply"
-    );
-} catch (\DomainException $e) {
-    // Handle "Maximum nesting depth reached"
-}
-```
-
-### Toggle a like
-
-```php
-$service = new \App\Services\CommentService();
-
-$isLiked = $service->toggleLike(
-    commentId: $commentId,
-    userId: auth()->id()
-);
-// Returns true (liked) or false (unliked)
-```
-
-### Delete a comment
-
-```php
-$service = new \App\Services\CommentService();
-
-$service->deleteComment(
-    commentId: $commentId,
-    userId: auth()->id()
-);
-```
-
----
-
-## ⚙️ Setup
+## ⚙️ Quick Start
 
 ```bash
-# Install dependencies
+# 1. Install dependencies
 composer install
+npm install
 
-# Configure database
+# 2. Setup environment
 cp .env.example .env
-# Edit .env → set DB_DATABASE, DB_USERNAME, DB_PASSWORD
-
-# Generate app key
 php artisan key:generate
 
-# Run migrations
-php artisan migrate
+# 3. Initialize Database & Assets
+php artisan migrate:fresh --seed
+php artisan filament:assets
+
+# 4. Start Server
+php artisan serve
+npm run dev
 ```
-
----
-
-## 📄 License
-
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
-# scalable-comment-system
